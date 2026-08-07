@@ -1,6 +1,6 @@
 # RAG Demo — 本地 PDF 问答服务
 
-一个精简的 RAG（Retrieval-Augmented Generation）Demo：加载本地 PDF，切块后存入向量库，收到问题时先检索最相关的片段，再让大模型基于这些片段回答，并返回引用来源。
+一个精简的 RAG + Agent Demo：加载本地 PDF，切块后存入 FAISS，Agent 根据问题自主决定是否调用知识库检索工具，再基于证据回答并返回来源。
 
 ## 技术选型
 
@@ -17,7 +17,7 @@
 
 ```
 rag-demo/
-├── app.py            # FastAPI 服务（加载 PDF → 建库 → /ask）
+├── app.py            # FastAPI 服务（加载 PDF → 建库 → Agent + RAG tool → /ask）
 ├── requirements.txt  # 依赖清单
 ├── .env              # API 密钥（不入库）
 ├── data/
@@ -41,6 +41,8 @@ pip install -r requirements.txt
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 OPENAI_MODEL=deepseek-chat
+# 可选：指定本地 sentence-transformers 模型目录
+# EMBEDDING_MODEL=C:\path\to\all-MiniLM-L6-v2
 ```
 
 ### 3. 放入 PDF
@@ -49,11 +51,22 @@ OPENAI_MODEL=deepseek-chat
 
 ### 4. 启动服务
 
+PowerShell（本机已有模型缓存的启动方式）：
+
+```powershell
+$env:Path = "C:\Users\ckk\Desktop\留学\week1-llm-api\.venv\Scripts;" + $env:Path
+$env:EMBEDDING_MODEL = "C:\Users\ckk\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+Set-Location "C:\Users\ckk\Desktop\留学\rag-demo"
+python -m uvicorn app:app --host 127.0.0.1 --port 8001
+```
+
+通用启动方式（模型可从 Hugging Face 下载或已由当前 Python 环境正确缓存）：
+
 ```bash
 uvicorn app:app --reload
 ```
 
-启动时会加载 PDF 并构建向量库，看到 `[startup] 已加载 PDF，切成 N 块` 表示就绪。
+启动时会加载 embedding 模型、PDF 并构建向量库，看到 `[startup] 已加载 PDF，切成 N 块` 表示就绪。若本地缓存自动发现失败，必须通过 `EMBEDDING_MODEL` 指定模型目录；不要只设置 `HF_HOME`。
 
 ### 5. 提问
 
@@ -67,17 +80,24 @@ uvicorn app:app --reload
 
 ```json
 {
-  "answer": "Our approach uses 9,580 tokens on average, which is 96.7% lower than GraphRAG's 293,872 tokens.",
-  "sources": ["命中片段原文..."]
+  "answer": "基于论文内容整理的回答...",
+  "sources": [{"source": "paper.pdf p.7", "content": "命中片段原文..."}],
+  "tool_calls": ["retrieve_knowledge_base"]
 }
 ```
+
+## 三类演示问题
+
+1. 直接回答：`什么是 Python？`，预期 `tool_calls` 为空。
+2. 触发检索：`paper.pdf 中 GraphRAG 的 token consumption 是多少？`，预期调用 `retrieve_knowledge_base` 并返回来源。
+3. 信息不足：`paper.pdf 是否讨论了量子计算？`，预期先检索，再明确说明现有证据不足，不编造结论。
 
 ## API
 
 | 方法 | 路径 | 说明 |
 |:--|:--|:--|
 | GET | `/health` | 健康检查，返回 `{"status": "ok"}` |
-| POST | `/ask` | 提问，请求 `{"question": "..."}`，返回 `{"answer": "...", "sources": [...]}` |
+| POST | `/ask` | 提问，Agent 自主决定是否检索，返回 `answer`、`sources` 和 `tool_calls` |
 
 ## 调参建议
 
@@ -89,4 +109,4 @@ uvicorn app:app --reload
 
 ## 原理一句话
 
-检索是向量搜索做的，不是大模型做的：PDF 切块 → 转向量存库 → 问题转向量 → 相似度最高的 K 块 → 只把这 K 块发给大模型组织语言。这样省 token、响应快、回答有依据。
+Agent 先判断问题是否需要文档证据；需要时调用 `retrieve_knowledge_base`：PDF 切块 → 转向量存库 → 问题转向量 → 相似度最高的 K 块 → 将结果连同来源交给大模型组织语言。这样常识问题不必检索，文档问题可追溯。

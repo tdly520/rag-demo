@@ -3,6 +3,7 @@ uvicorn
 langchain
 langchain-community
 langchain-openai
+langgraph
 langchain-text-splitters
 pypdf
 faiss-cpu

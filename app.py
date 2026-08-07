@@ -34,6 +34,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+import json
 
 
 # ===== 配置 =====
@@ -54,7 +57,8 @@ splitter = RecursiveCharacterTextSplitter(
 )
 chunks = splitter.split_documents(pages)
 
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 vectorstore = FAISS.from_documents(chunks, embeddings)
 retriever = vectorstore.as_retriever(search_kwargs={"k": RETRIEVE_K})
 
@@ -62,6 +66,31 @@ llm = ChatOpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
     model=os.getenv("OPENAI_MODEL", "deepseek-chat"),
+)
+
+
+@tool
+def retrieve_knowledge_base(question: str) -> str:
+    """检索本地 PDF 知识库。仅当问题需要 paper.pdf 中的具体事实时调用。"""
+    hits = retriever.invoke(question)
+    results = [
+        {
+            "source": f"paper.pdf p.{doc.metadata.get('page', 0) + 1}",
+            "content": doc.page_content,
+        }
+        for doc in hits
+    ]
+    return json.dumps(results, ensure_ascii=False)
+
+
+agent = create_react_agent(
+    llm,
+    tools=[retrieve_knowledge_base],
+    prompt=(
+        "你是一个知识库问答 Agent。普通常识问题直接回答，不要调用工具。"
+        "如果问题询问 paper.pdf 中的具体内容、实验数据或论文结论，必须调用"
+        "retrieve_knowledge_base。只能依据工具返回的内容回答；证据不足时明确说明。"
+    ),
 )
 
 print(f"[startup] 已加载 PDF，切成 {len(chunks)} 块")
@@ -93,26 +122,24 @@ def health():
 #     sources 里建议包含原文片段，方便用户核对回答是不是有依据
 @app.post("/ask")
 def ask(req: AskRequest):
-    hits=retriever.invoke(req.question)
-    context="\n\n".join([doc.page_content for doc in hits])
-    prompt = f"""基于以下上下文回答问题。如果上下文不足以回答问题，请如实告知。
+    result = agent.invoke({"messages": [("user", req.question)]})
+    messages = result["messages"]
+    tool_calls = [
+        message.name
+        for message in messages
+        if getattr(message, "type", "") == "tool"
+    ]
+    sources = []
+    for message in messages:
+        if getattr(message, "type", "") != "tool":
+            continue
+        try:
+            sources.extend(json.loads(message.content))
+        except (TypeError, json.JSONDecodeError):
+            continue
 
-    上下文：
-    {context}
-
-    问题：{req.question}
-
-    回答："""
-
-    # 4. 调用 LLM
-    response = llm.invoke(prompt)  # 返回 AIMessage
-    answer = response.content
-
-    # 5. 提取来源（每块的原文片段）
-    sources = [doc.page_content for doc in hits]
-
-    # 6. 返回结果
     return {
-        "answer": answer,
-        "sources": sources
+        "answer": messages[-1].content,
+        "sources": sources,
+        "tool_calls": tool_calls,
     }
